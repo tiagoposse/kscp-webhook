@@ -1,16 +1,16 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 
-	"github.com/snorwin/jsonpatch"
-	"github.com/tiagoposse/kscp-webhook/internal/mutator"
+	"github.com/tiagoposse/secretsbeam-webhook/internal/pods"
+	"github.com/tiagoposse/secretsbeam-webhook/internal/serviceaccounts"
 	admissionv1 "k8s.io/api/admission/v1"
-	v1 "k8s.io/api/core/v1"
 )
 
 type server struct {
@@ -18,13 +18,30 @@ type server struct {
 	tlsCertPath string
 	tlsKeyPath  string
 	sslEnabled  bool
+	pod         *pods.PodMutator
+	sa          *serviceaccounts.ServiceAccountMutator
+}
+
+type Mutator interface {
+	HandleMutate(context.Context, []byte) ([]byte, error)
 }
 
 func NewServer(opts ...ServerOption) *server {
-	http.HandleFunc("/healthz", health)
-	http.HandleFunc("/mutate", handleMutate)
+	sa := serviceaccounts.NewServiceAccountMutator()
+	pod := pods.NewPodMutator()
 
-	s := &server{}
+	http.HandleFunc("/healthz", health)
+	http.HandleFunc("/serviceaccounts", func(w http.ResponseWriter, r *http.Request) {
+		handleMutate(w, r, sa)
+	})
+	http.HandleFunc("/pods", func(w http.ResponseWriter, r *http.Request) {
+		handleMutate(w, r, pod)
+	})
+
+	s := &server{
+		sa:  sa,
+		pod: pod,
+	}
 	for _, o := range opts {
 		o(s)
 	}
@@ -45,9 +62,8 @@ func (s *server) Serve() error {
 	return nil
 }
 
-func handleMutate(w http.ResponseWriter, r *http.Request) {
+func handleMutate(w http.ResponseWriter, r *http.Request, mut Mutator) {
 	var admissionReview admissionv1.AdmissionReview
-	var admissionResponse admissionv1.AdmissionResponse
 
 	// Unmarshal whole request
 	body, err := io.ReadAll(r.Body)
@@ -61,53 +77,23 @@ func handleMutate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Unmarshal pods
-	pod := &v1.Pod{}
-	original := &v1.Pod{}
-	if err := json.Unmarshal(admissionReview.Request.Object.Raw, pod); err != nil {
-		http.Error(w, fmt.Sprintf("could not unmarshal pod object: %v", err), http.StatusBadRequest)
-		return
-	}
-	if err := json.Unmarshal(admissionReview.Request.Object.Raw, original); err != nil {
-		http.Error(w, fmt.Sprintf("could not unmarshal pod object: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	// Get secrets from annotations
-	secrets := mutator.GetSecretsFromAnnotations(pod.Annotations)
-
-	paths := make([]string, 0)
-	if pod.Spec.InitContainers == nil {
-		pod.Spec.InitContainers = make([]v1.Container, 0)
-	}
-	for provider, providerSecrets := range secrets {
-		cont, err := mutator.ParseProvider(provider, pod, providerSecrets)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("could not unmarshal pod object: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		paths = mutator.MutateVolumes(provider, cont.VolumeMounts, pod, paths)
-		pod.Spec.InitContainers = append(pod.Spec.InitContainers, *cont)
-	}
-
-	patch, err := jsonpatch.CreateJSONPatch(pod, original)
+	patch, err := mut.HandleMutate(context.Background(), admissionReview.Request.Object.Raw)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("could not unmarshal pod object: %v", err), http.StatusBadRequest)
+		fmt.Printf("mutating: %v\n", err.Error())
+		http.Error(w, fmt.Sprintf("executing mutation: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	admissionResponse = admissionv1.AdmissionResponse{
+	admissionReview.Response = &admissionv1.AdmissionResponse{
 		UID:     admissionReview.Request.UID,
-		Patch:   patch.Raw(),
 		Allowed: true,
+		Patch:   patch,
 		PatchType: func() *admissionv1.PatchType {
 			pt := admissionv1.PatchTypeJSONPatch
 			return &pt
 		}(),
 	}
 
-	admissionReview.Response = &admissionResponse
 	respBytes, err := json.Marshal(admissionReview)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("could not marshal response: %v", err), http.StatusInternalServerError)

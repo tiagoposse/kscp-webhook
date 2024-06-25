@@ -5,7 +5,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/tiagoposse/kscp-webhook/internal/server"
+	"github.com/tiagoposse/secretsbeam-webhook/internal/server"
 )
 
 func main() {
